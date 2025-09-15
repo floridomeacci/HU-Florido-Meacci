@@ -1,8 +1,10 @@
 import re
 import sys
 import tomllib
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 
 import click
 import pandas as pd
@@ -11,6 +13,7 @@ from loguru import logger
 from wa_analyzer.settings import (BaseRegexes, Folders, PreprocessConfig,
                                   androidRegexes, csvRegexes, iosRegexes,
                                   oldRegexes)
+from wa_analyzer.humanhasher import humanize
 
 logger.remove()
 logger.add("logs/logfile.log", rotation="1 week", level="DEBUG")
@@ -30,12 +33,54 @@ class WhatsappPreprocessor:
         records, _ = self.process()
         self.save(records)
 
+    @staticmethod
+    def normalize_author(name: str) -> str:
+        """Return a canonical representation of an author name.
+
+        This reduces spurious duplicates caused by invisible characters,
+        tildes/prefixes, and odd unicode spaces.
+
+        Steps:
+        - Unicode normalize to NFKC (compatibility composition)
+        - Remove zero-width chars (ZWSP, ZWJ, ZWNJ, BOM)
+        - Replace non-breaking space variants with regular spaces
+        - Remove leading tilde variants and adjacent spaces (seen in exports)
+        - Collapse internal whitespace and strip ends
+
+        We intentionally do NOT change case or strip diacritics to preserve
+        readability of display names while still unifying common variants.
+        """
+        if not isinstance(name, str):
+            return name
+        s = unicodedata.normalize("NFKC", name)
+        # Remove zero-width characters
+        s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+        # Normalize common non-breaking spaces to regular spaces
+        s = s.replace("\u00A0", " ")  # NBSP
+        s = s.replace("\u202F", " ")  # NNBSP (narrow no-break space)
+        # Remove leading tilde variants and any following spaces
+        s = re.sub(r"^[~\u223C]\s*", "", s)
+        # Collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
     def save(self, records: list[tuple]) -> Path:
         df = pd.DataFrame(records, columns=["timestamp", "author", "message"])
         now = datetime.now().strftime("%Y%m%d-%H%M%S")
         outfile = self.folders.processed / f"whatsapp-{now}.csv"
         logger.info(f"Writing to {outfile}")
         df.to_csv(outfile, index=False)
+        # Also write anonymized reference mapping built from ORIGINAL authors
+        try:
+            authors = df["author"].dropna().unique().tolist()
+            anon = {k: humanize(k) for k in authors}
+            ref = {v: k for k, v in anon.items()}  # anonymized -> original
+            reference_file = self.folders.processed / "anon_reference.json"
+            with reference_file.open("w", encoding="utf-8") as f:
+                json.dump({k: ref[k] for k in sorted(ref.keys())}, f, ensure_ascii=False, indent=2)
+            logger.info(f"Wrote anonymization reference to {reference_file}")
+        except Exception as e:
+            logger.warning(f"Could not write anon_reference.json: {e}")
         logger.success("Done!")
 
         return outfile
@@ -74,12 +119,11 @@ class WhatsappPreprocessor:
                             f"Could not find an author for line {line_number}. Please check the data and / or the author regex"
                         )
                         continue
-                    author = author_.groups()[0].strip()
+                    raw_author = author_.groups()[0].strip()
+                    author = self.normalize_author(raw_author)
                     if any(drop_author in author for drop_author in self.drop_authors):
                         logger.warning(f"Skipping author {author}")
                         continue
-                    clean_tilde = r"^~\u202f"
-                    author = re.sub(clean_tilde, "", author)
                     msg = msg_.groups()[0].strip()
                     records.append((timestamp, author, msg))
                 elif len(records) > 0:

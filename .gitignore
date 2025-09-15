@@ -21,3 +21,5 @@ config.toml
 data/processed/**
 dev/
 .current_values.json
+data/processed/this.csv
+data/processed/this.parq
